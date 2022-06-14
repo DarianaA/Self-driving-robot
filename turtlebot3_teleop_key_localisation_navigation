@@ -1,0 +1,833 @@
+#!/usr/bin/env python
+
+try:
+    import Queue as Q  # ver. < 3.0
+except ImportError:
+    import queue as Q
+import rospy
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Illuminance, LaserScan
+from geometry_msgs.msg import Twist
+import time
+import math
+
+import sys, select, os
+
+
+class Astar:
+
+    def __init__(self, start, goal, width, height, square_size=1.0):
+        self.width = width
+        self.height = height
+        self.frontier = Q.PriorityQueue()
+        self.start = start
+        self.goal = goal
+        self.frontier.put((0, start))
+        self.came_from = {start: None}
+        self.cost_so_far = {start: 0}
+        self.square_size = square_size
+        self.G = [[0 for i in range(width)] for i in range(height)]  # zero means empty / no obstacle
+
+    def add_obstacle_rc(self, row, col):
+        """taking in two ints in form (y,x) aka (row,col)"""
+        self.G[row][col] = 1
+
+    def add_obstacle_xy(self, x, y):
+        """taking in two ints in form (x,y) aka (col,row)"""
+        self.G[y][x] = 1
+
+    def show_G(self):
+        """displays grid G with 0 for empty and 1 for obstacle"""
+        self.G.reverse()
+        print("G, 1=obstacle :")
+        for r in self.G:
+            print(r)
+        print()
+        self.G.reverse()
+
+    def cost(self, current, next_node):
+        """calculates cost between two nodes using euclidean distance (assuming nodes/squares of size 1)"""
+        diff_x, diff_y = abs(current[0] - next_node[0]), abs(current[1] - next_node[1])
+        if diff_x == 0 and diff_y == 0:
+            return 0
+        elif diff_x == 0 or diff_y == 0:
+            return self.square_size  # horizontal/vertical cost
+        else:
+            return math.sqrt(self.square_size**2 + self.square_size**2)  # diagonal cost (pythagoras)
+
+    def heuristic(self, n):
+        """diagonal distance heuristic"""
+        diff_x, diff_y = abs(self.goal[0] - n[0]), abs(self.goal[1] - n[1])
+        D2 = math.sqrt(self.square_size**2 + self.square_size**2)  # diagonal cost
+        D = self.square_size  # horizontal / vertical cost
+        return D * (diff_x + diff_y) + (D2 - 2 * D) * min(diff_x, diff_y)
+
+    def get_neighbours(self, cell):
+        """Takes a matrix and a cell/node/square and gets all valid neighbours in the matrix"""
+        check = lambda c: 0 <= c[0] < self.width and 0 <= c[1] < self.height and self.G[c[1]][c[0]] == 0
+        add = lambda inc: (inc[0] + cell[0], inc[1] + cell[1])
+        neighbour_incs = [(0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1)]
+        return list(filter(check, list(map(add, neighbour_incs))))
+
+    def run_a_star(self):
+        """run the a star algorithm"""
+        # make dict that shows where we came from
+        while not self.frontier.empty():
+            current = self.frontier.get()  # gets with lowest priority first
+            if current[1] == self.goal:
+                break
+            for next_node in self.get_neighbours(current[1]):
+                new_cost = self.cost_so_far[current[1]] + self.cost(current[1], next_node)
+                if next_node not in self.cost_so_far or new_cost < self.cost_so_far[next_node]:
+                    self.cost_so_far[next_node] = new_cost
+                    priority = new_cost + self.heuristic(next_node)
+                    self.frontier.put((priority, next_node))
+                    self.came_from[next_node] = current[1]
+
+    def get_path(self):
+        """'computes and returns the path, must be called after run_a_star()"""
+        # now we find a path by undoing the dict
+        current = self.goal
+        path = []
+        try:
+            while current != self.start:
+                path.append((current[0], current[1]))
+                current = self.came_from[current]
+        except KeyError:
+            print("NOT ABLE TO FIND PATH")
+        path.append(self.start)
+        path.reverse()
+        return path
+
+    def show_path_on_G(self):
+        print()
+        path = self.get_path()
+        # make empty grid
+        temp_g = [["-" for i in range(self.width)] for i in range(self.height)]
+        # draw obstacles
+        for r in range(len(self.G)):
+            for c in range(len(self.G[0])):
+                if self.G[r][c] != 0:
+                    temp_g[r][c] = "X"
+        # draw path
+        i = 1  # start path at 1
+        for p in path:
+            temp_g[p[1]][p[0]] = str(i)
+            i += 1
+
+        temp_g.reverse()
+
+        for r in temp_g:
+            temp_string = ""
+            for e in r:
+                if len(e) == 1:
+                    temp_string+= " " + e + " "
+                elif len(e) == 2:
+                    temp_string += " " + e
+                else:
+                    print("UNRECOGNISED")
+            print(temp_string)
+        print()
+
+
+if os.name == 'nt':  # check if running on windows ('nt' is for windows and 'posix' is for linux)
+    import msvcrt
+else:
+    import tty, termios
+
+WAFFLE_MAX_LIN_VEL = 0.26
+WAFFLE_MAX_ANG_VEL = 1.82
+
+def stop(pub):
+    twist = Twist()
+    twist.linear.x = 0.0
+    twist.linear.y = 0.0
+    twist.linear.z = 0.0
+    twist.angular.x = 0.0
+    twist.angular.y = 0.0
+    twist.angular.z = 0.0
+    pub.publish(twist)
+    rospy.sleep(1)
+
+
+def constrain(input, low, high):
+    if input < low:
+        input = low
+    elif input > high:
+        input = high
+    else:
+        input = input
+
+    return input
+
+
+def makeSimpleProfile(output, input, slop):
+    if input > output:
+        output = min(input, output + slop)
+    elif input < output:
+        output = max(input, output - slop)
+    else:
+        output = input
+
+    return output
+
+
+def checkLinearLimitVelocity(vel):
+    return constrain(vel, -WAFFLE_MAX_LIN_VEL, WAFFLE_MAX_LIN_VEL)
+
+
+def checkAngularLimitVelocity(vel):
+    return constrain(vel, -WAFFLE_MAX_ANG_VEL, WAFFLE_MAX_ANG_VEL)
+
+
+def getKey():
+    if os.name == 'nt':
+        return msvcrt.getch()
+
+    tty.setraw(sys.stdin.fileno())
+    rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+    if rlist:
+        key = sys.stdin.read(1)
+    else:
+        key = ''
+
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+    return key
+
+
+# variables that subscribers will use
+leftLightIntensity = Illuminance()
+rightLightIntensity = Illuminance()
+angPosz = 0
+xPose = 0
+yPose = 0
+
+# global variables
+parked = False
+obstacleColor = ""
+wall = False
+
+
+# callbacks
+
+def calculate_phi_callback(msg):
+    global angPosz
+    global xPose, yPose
+    # get phi_d and calculate phi
+    odomPose = msg.pose.pose
+    orientation_list = [odomPose.orientation.x, odomPose.orientation.y, odomPose.orientation.z, odomPose.orientation.w]
+    (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+    angPosz = yaw
+    # compute current position of robot frame
+    xPose = odomPose.position.x
+    yPose = odomPose.position.y
+
+
+def left_light_sensor_callback(msg):
+    global leftLightIntensity
+    leftLightIntensity = msg.illuminance
+
+
+def right_light_sensor_callback(msg):
+    global rightLightIntensity
+    rightLightIntensity = msg.illuminance
+
+
+def move(vel):
+    """Move the robot 0.1m forward or backwards"""
+    distance_interval = 0.1
+    t = distance_interval / abs(vel)
+
+    twist = Twist()
+    stop(pub)
+    for i in range(1):
+        yaw_controller(1.570000)  # 90 degrees
+        twist.linear.x = vel
+        pub.publish(twist)
+        rospy.sleep(t)
+    stop(pub)
+
+
+def moveFrw():
+    """move forward for 0.01 seconds to activate callbacks"""
+    twist = Twist()
+    v = 0.05
+    t = 0.01
+    twist.linear.x = v / 2.0
+    pub.publish(twist)
+    rospy.sleep(t)
+    stop(pub)
+
+
+def readLine():
+    """detect cell / pad colour based on left light sensor illuminance value"""
+    leftLightSensor = leftLightIntensity
+    if math.floor(leftLightSensor) == 144:  # reads purple
+        return 144
+    elif math.floor(leftLightSensor) == 170:  # reads yellow
+        return 170
+    elif leftLightSensor < 100:  # reads grey
+        return 1
+    elif leftLightSensor > 220:  # reads white
+        return 0
+    elif 200 < leftLightSensor < 210:  # reads outside
+        return -1
+    else:  # error
+        return -2
+
+
+def getReadingString(r):
+    """return the colour read, as a string"""
+    if r == -1:
+        return "out"
+    elif r == 1:
+        return "black"
+    elif r == 0:
+        return "white"
+    elif r == 144:
+        return "purple"
+    elif r == 170:
+        return "yellow"
+    else:
+        return "ERROR - unidentified colour"
+
+
+act_work = 0.95
+act_wrong = 0.05
+
+sensor_model = [[0.9, 0.1, 0.1, 0.9, 0.9, 0.1, 0.1, 0.1, 0.9, 0.9, 0.1, 0.1, 0.1, 0.9, 0.1, 0.1, 0.9, 0.9, 0.1, 0.1, 0.1, 0.9, 0.1, 0.1],  # reading = 0 (white)
+                [0.1, 0.9, 0.9, 0.1, 0.1, 0.9, 0.9, 0.9, 0.1, 0.1, 0.9, 0.9, 0.9, 0.1, 0.9, 0.9, 0.1, 0.1, 0.9, 0.9, 0.9, 0.1, 0.9, 0.9]]  # reading = 1 (grey)
+
+
+def bayes_filter(bel, d, measure):
+    global act_wrong, act_work, sensor_model
+    n = 0
+
+    # perceptual case
+    if d == "reading":
+        for i in range(24):
+            bel[i] = round(sensor_model[measure][i] * bel[i], 2)
+            n += bel[i]
+        n = 1 / n
+        for i in range(24):
+            bel[i] = round(n * bel[i], 2)
+    elif d in ["right", "left"]:
+        temp_bel = [0 for i in range(24)]
+        if d == "left":
+            for x in range(24):
+                if x == 0:
+                    temp_bel[x] = round(0 + (act_wrong / 2) * bel[x] + (act_wrong / 2) * bel[x + 1], 2)
+                elif x == 23:
+                    temp_bel[x] = round(act_work * bel[x - 1] + act_wrong * bel[x], 2)
+                else:
+                    temp_bel[x] = round(act_work * bel[x - 1] + (act_wrong / 2) * bel[x] + (act_wrong / 2) * bel[x + 1], 2)
+        elif d == "right":
+            for x in range(24):
+                if x == 23:
+                    temp_bel[x] = round(0 + (act_wrong / 2) * bel[x] + (act_wrong / 2) * bel[x - 1], 2)
+                elif x == 0:
+                    temp_bel[x] = round(act_work * bel[x + 1] + act_wrong * bel[x], 2)
+                else:
+                    temp_bel[x] = round(act_work * bel[x + 1] + (act_wrong / 2) * bel[x] + (act_wrong / 2) * bel[x - 1], 2)
+        bel = temp_bel
+    else:
+        print("D IS NOT VALID")
+
+    return bel
+
+
+def localisation():
+    belief = [0.1 for i in range(24)]  # initial
+
+    # solve wrong first reading by insignificantly moving the robot
+    # so that the sensors start reading
+    reading1 = readLine()
+    moveFrw()
+
+    print("INITIAL BELIEF: ")
+    print(belief)
+    reading = readLine()
+    print("READING: %s" % getReadingString(reading))
+    belief = bayes_filter(belief, "reading", reading)  # take sensor reading
+    print("UPDATED BELIEF: ")
+    print(belief)
+
+    stopWhile = False
+    change = False
+    while True:
+        cnt = 0
+        # move robot 4 cells to the left
+        while cnt < 4:
+            if wall:  # if wall detected, change to right
+                print("WALL")
+                break
+            if change:
+                # if robot read outside while moving right, it moves 4 + 7 cells to the left
+                # to prevent being stuck in the same cells
+                cnt = -7
+                change = False
+            if max(belief) >= 0.80:
+                print("STOP")
+                stopWhile = True
+                break
+            # move left
+            print("ACTION: left")
+            move(0.05)
+            if readLine() != -1:
+                belief = bayes_filter(belief, "left", reading)
+            # take sensor reading
+            reading = readLine()
+            if reading != -1:
+                print("READING: %s %s" % (reading, getReadingString(reading)))
+                belief = bayes_filter(belief, "reading", reading)
+            print("BELIEF: ")
+            print(belief)
+
+            cnt += 1
+
+        cnt = 0
+        if stopWhile:
+            break
+
+        while cnt < 7:
+            # move robot 7 cells to the right
+            if reading == -1:
+                # change to move left if reading outside the line
+                print("OUT")
+                change = True
+                break
+            if max(belief) >= 0.80:
+                stopWhile = True
+                break
+            print("ACTION: right")
+            move(-0.05)
+            if readLine() != -1:
+                belief = bayes_filter(belief, "right", reading)
+            # take sensor reading
+            reading = readLine()
+            if reading != -1:
+                print("READING: %s %s" % (reading, getReadingString(reading)))
+                belief = bayes_filter(belief, "reading", reading)
+
+            print("BELIEF: ")
+            print(belief)
+
+            cnt += 1
+
+        if stopWhile:
+            break
+
+    m = 0
+    for i in range(24):
+        if belief[i] == max(belief):
+            m = i
+            i = 24
+
+    print("The robot is in the: %s th cell" % m)
+    return m
+
+
+def getGridCoord(y):
+    x = 2.132171
+    gridPos = [-5.066390, -4.975405, -4.884283, -4.777307, -4.683504, -4.573423, -4.487462, -4.379527, -4.269674,
+               -4.171940, -4.083390, -3.979782, -3.882046, -3.781588, -3.683762, -3.582122, -3.484349, -3.380727,
+               -3.274433, -3.178620, -3.075019, -2.975327, -2.904294, -2.801570]
+    return x, gridPos[y-1]
+
+
+def check_obstacle(msg):
+    """check for barrier in front of robot --- look for closest object as lidar does not detect the barrier"""
+    global wall
+    if not math.isinf(msg.ranges[0]):  # detected obstacle
+        if msg.range_min + 0.1 < msg.ranges[0] < 2:
+            wall = True
+        else:
+            wall = False
+
+
+def yaw_controller(desPhi):
+    global angPosz
+    phiError = desPhi - angPosz
+    error = 2 * math.pi / 180
+    twist = Twist()
+    while abs(phiError) > error:
+        twist.angular.z = phiError * 0.2
+        phiError = desPhi - angPosz
+        pub.publish(twist)
+    twist.angular.z = 0.0
+
+
+def park():
+    """Enter the parking spot and stop when detected the pad colour"""
+    global parked, obstacleColor
+    xPark = 1.705811
+    yPark = -0.938150
+    x, y = 0.849190, -1.824572
+    Kp = 0.3
+    Tp = 0.08
+    errAngThreshold = math.pi / 180 * 2
+    twist = Twist()
+    reading = readLine()
+    moveFrw()
+    reading = readLine()
+
+    xError = xPark - x
+    yError = yPark - y
+    desPhi = math.atan2(yError, xError)
+    phiError = correction(desPhi, angPosz)
+    while abs(phiError) > errAngThreshold:
+        twist.angular.z = Kp * phiError
+        phiError = correction(desPhi, angPosz)
+        pub.publish(twist)
+    stop(pub)
+
+    while reading != 144 or reading != 170:
+        key = getKey()
+        if key == '\x03':  # break if ctrl+c pressed
+            break
+
+        yaw_controller(desPhi)
+        if abs(phiError) < errAngThreshold:
+            twist.linear.x = Tp
+            twist.angular.z = 0
+        pub.publish(twist)
+        reading = readLine()
+        if reading == 144 or reading == 170:
+            stop(pub)
+            obstacleColor = getReadingString(reading)
+            print(obstacleColor)
+            break
+    stop(pub)
+    parked = True
+
+
+def leave_parking_space(x, y):
+    """move backwards until arrived at the parking entrance locations"""
+    global parked
+    parked = True
+    d = euclidean_distance(x, y, xPose, yPose)
+    print(d)
+    v = -0.08
+    t = d / abs(v)
+
+    desPhi = 0.737693
+    twist = Twist()
+    if parked:
+        yaw_controller(desPhi)
+        twist.linear.x = v
+        pub.publish(twist)
+        rospy.sleep(t)
+        stop(pub)
+        parked = False
+    stop(pub)
+
+
+def euclidean_distance(p11, p12, p21, p22):
+    return math.sqrt((p21 - p11)**2 + (p22 - p12)**2)
+
+
+def correction(desPhi, angPos):
+    """compute minimum rotation angle to a desired angular position and direction of rotation"""
+    phiError = 0.0
+    if 0 <= angPos <= math.pi:
+        if 0 <= desPhi <= math.pi:
+            phiError = desPhi - angPos
+        elif 0 > desPhi > angPos - math.pi:
+            phiError = desPhi - angPos
+        else:
+            phiError = 2 * math.pi + (desPhi - angPos)
+    else:
+        if angPos < desPhi < math.pi + angPos:
+            phiError = desPhi - angPos
+        elif desPhi <= angPos and desPhi < math.pi + angPos:
+            phiError = desPhi - angPos
+        else:
+            phiError = -((math.pi + angPos) + (math.pi - desPhi))
+    return phiError
+
+
+def move_to(pub, desX, desY):
+    print("moving to", desX, desY)
+    global angPosz
+    global xPose
+    global yPose
+    twist = Twist()
+    Kp = 0.4
+    Tp = 0.1
+
+    errAngThreshold = 3 * math.pi / 180  # threshold = 3 degree
+    errDistThreshold = 0.015
+
+    while euclidean_distance(xPose, yPose, desX, desY) > errDistThreshold:
+        key = getKey()
+        if key == '\x03':  # break if ctrl+c pressed
+            break
+        xError = desX - xPose
+        yError = desY - yPose
+        desPhi = math.atan2(yError, xError)
+        phiError = correction(desPhi, angPosz)
+
+        twist.angular.z = Kp * phiError
+
+        if abs(phiError) < errAngThreshold:
+            twist.linear.x = Tp
+            twist.angular.z = 0
+
+        pub.publish(twist)
+    #stop(pub)
+
+
+def from_cartesian_to_cell(point, square_size):
+    """Takes in a cartesian point (grid_xy form) and returns the integer pair representing the bottom left corner square it's in.
+    Can pass result into make_obstacle_xy() """
+    return abs(int(point[0] / square_size)), abs(int(point[1] / square_size))
+
+
+def from_cell_to_cartesian(row, col, square_size):
+    """takes row and column of a matrix (which represents bottom left corner of a square and converts to cartesian at
+    center of that square) """
+    return (row * square_size + (square_size / 2)), (col * square_size + (square_size / 2))
+
+
+def distance_obstacles(a_star, pos1, pos2, square_size):
+    # Marks grid with 1s if distance between obstacles is less than robot's diameter
+    if abs(pos1[0] - pos2[0]) <= 0.266:
+        point1 = from_cartesian_to_cell((pos1[0], pos1[1]), square_size)
+        point2 = from_cartesian_to_cell((pos2[0], pos2[1]), square_size)
+        for i in range(point1[0], point2[0]):
+            a_star.add_obstacle_xy(i, point1[1])
+        for i in range(point2[0], point2[0]):
+            a_star.add_obstacle_xy(i, point1[1])
+
+
+def create_cylinder_obstacle(a_star, pos, radius, square_size):
+    """makes a square obstacle containing cylinder"""
+    bottom_corner = from_cartesian_to_cell((pos[0] - radius, pos[1] - radius), square_size)
+    n = int(math.ceil((2 * radius) / square_size))  # do ceiling so square completely encloses cylinder
+
+    extra_padding = 1
+    bottom_corner = bottom_corner[0] - extra_padding, bottom_corner[1] - extra_padding
+
+    for x in range(n + 2 * extra_padding):
+        for y in range(n + 2 * extra_padding):
+            a_star.add_obstacle_xy(bottom_corner[0] + x, bottom_corner[1] + y)
+
+
+def gazebo_xy_to_grid_xy(point):
+    """takes xy in coordinates of quadrant grid is in and converts them to grid xy, i.e x,y => -y,x """
+    return -point[1], point[0]
+
+
+def grid_xy_to_gazebo_xy(point):
+    """takes, grid xy and converts them to quadrant arena is in, i.e x,y => y,-x"""
+    return point[1], -point[0]
+
+
+x1, y1, x2, y2 = 0.0, 0.0, 0.0, 0.0
+
+
+def run_a_star_left(x, y):
+    global x1, x2, y1, y2
+    start = gazebo_xy_to_grid_xy((x, y))
+    red_cylinder_1 = gazebo_xy_to_grid_xy((x1, y1))
+    red_cylinder_2 = gazebo_xy_to_grid_xy((x2, y2))
+    barrier_data = {"x": 2.080000, "y": -3.009999, "width": 0.08, "length": 1.0}
+
+    goal = gazebo_xy_to_grid_xy((0.849190, -1.824572))
+
+    square_size = 0.266 / 2
+
+    start = from_cartesian_to_cell(start, square_size)
+    goal = from_cartesian_to_cell(goal, square_size)
+
+    # 4 BY 6 BIG SQUARES
+    width, height = int(6 / square_size), int(4 / square_size)
+    a_star = Astar(start, goal, width, height, square_size)
+
+    # Mark cylinder obstacles on grid
+    create_cylinder_obstacle(a_star, red_cylinder_1, 0.15, square_size)
+    create_cylinder_obstacle(a_star, red_cylinder_2, 0.15, square_size)
+
+    # Mark barrier on the grid
+    barrier_left_point = (barrier_data["x"] - (barrier_data["length"] / 2), barrier_data["y"])
+    barrier_left_cell = from_cartesian_to_cell(gazebo_xy_to_grid_xy((barrier_left_point[0], barrier_left_point[1])),
+                                               square_size)
+
+    for i in range(int(math.ceil(barrier_data["width"] / 2))):
+        for j in range(int(math.ceil(barrier_data["length"] / square_size))):
+            a_star.add_obstacle_xy(barrier_left_cell[0] + i, barrier_left_cell[1] + j)
+
+    # increase barrier area so that the right side of the map is not the best path
+    barrier_right_point = (barrier_data["x"] + barrier_data["length"] / 2, barrier_data["y"])
+    barrier_right_cell = from_cartesian_to_cell(gazebo_xy_to_grid_xy((barrier_right_point[0], barrier_right_point[1])), square_size)
+    for i in range(int(math.ceil(barrier_data["width"] / 2))):
+        for j in range(int(math.ceil(barrier_data["length"] / square_size))):
+            a_star.add_obstacle_xy(barrier_right_cell[0] + i, barrier_right_cell[1] + j)
+
+    # Mark any other space the robot cannot go through
+    distance_obstacles(a_star, red_cylinder_1, red_cylinder_2, square_size)
+    distance_obstacles(a_star, (barrier_data["x"], barrier_data["y"]), red_cylinder_2, square_size)
+
+    a_star.run_a_star()
+    a_star.show_path_on_G()
+
+    print(a_star.get_path())
+
+    path = a_star.get_path()
+    # each time pop from the front of path and moveTo that position until there's no more to pop
+    path.reverse()
+    while len(path) > 0:
+        next_location = path.pop()
+        next_loc_cartesian = grid_xy_to_gazebo_xy(
+            from_cell_to_cartesian(next_location[0], next_location[1], square_size))
+        move_to(pub, next_loc_cartesian[0], next_loc_cartesian[1])
+
+    print("DONE")
+
+
+def run_a_star_right(x, y):
+    global obstacleColor
+    start = gazebo_xy_to_grid_xy((x, y))
+    cylinder = gazebo_xy_to_grid_xy((0.0, 0.0))
+    parking = gazebo_xy_to_grid_xy((1.6, -1))
+    forbidden = gazebo_xy_to_grid_xy((0.954383, -3.258579))
+    barrier_data = {"x": 2.080000, "y": -2.73, "width": 0.1, "length": 1.35}
+
+    if obstacleColor == "purple":
+        cylinder = gazebo_xy_to_grid_xy((3.34, -2.7))
+    elif obstacleColor == "yellow":
+        cylinder = gazebo_xy_to_grid_xy((2.899, -2.7))
+
+    goal = gazebo_xy_to_grid_xy((2.100681, -4.597397))
+
+    square_size = 0.266 / 2
+
+    start = from_cartesian_to_cell(start, square_size)
+    goal = from_cartesian_to_cell(goal, square_size)
+
+    # 4 BY 6 BIG SQUARES
+    width, height = int(6 / square_size), int(4 / square_size)
+    a_star = Astar(start, goal, width, height, square_size)
+    create_cylinder_obstacle(a_star, cylinder, 0.15, square_size)
+
+    # mark map for barrier
+    barrier_left_point = (barrier_data["x"] - (barrier_data["length"] / 2), barrier_data["y"])
+    barrier_left_cell = from_cartesian_to_cell(gazebo_xy_to_grid_xy((barrier_left_point[0], barrier_left_point[1])),
+                                               square_size)
+
+    for i in range(1+int(math.ceil(barrier_data["width"] / 2))):
+        for j in range(int(math.ceil(barrier_data["length"] / square_size))):
+            a_star.add_obstacle_xy(barrier_left_cell[0] + i, barrier_left_cell[1] + j)
+            a_star.add_obstacle_xy(barrier_left_cell[0] - i, barrier_left_cell[1] + j)
+
+    # mark map for parking space right wall
+    create_cylinder_obstacle(a_star, parking, 0.5, square_size)
+    create_cylinder_obstacle(a_star, forbidden, 0.7, square_size)
+    distance_obstacles(a_star, (barrier_data["x"], barrier_data["y"]), cylinder, square_size)
+
+    a_star.run_a_star()
+    a_star.show_path_on_G()
+
+    print(a_star.get_path())
+
+    path = a_star.get_path()
+    # each time pop from the front of path and moveTo that position until there's no more to pop
+    path.reverse()
+    while len(path) > 0:
+        next_location = path.pop()
+        next_loc_cartesian = grid_xy_to_gazebo_xy(
+            from_cell_to_cartesian(next_location[0], next_location[1], square_size))
+        move_to(pub, next_loc_cartesian[0], next_loc_cartesian[1])
+
+    print("DONE")
+
+
+if __name__ == "__main__":
+    if os.name != 'nt':
+        settings = termios.tcgetattr(sys.stdin)
+
+    # make node called turtlebot3_teleop_key
+    rospy.init_node('turtlebot3_teleop_key', anonymous=True)
+
+    # subscriber for odom to get phi_d
+    rospy.Subscriber('odom', Odometry, calculate_phi_callback)
+
+    # subscriber for laser scan to get distance to obstacle
+    rospy.Subscriber('scan', LaserScan, check_obstacle)
+
+    # subscriber for light sensorS to get illuminance
+    rospy.Subscriber('light_sensor_plugin/leftLightSensor', Illuminance, left_light_sensor_callback)
+
+    rospy.Subscriber('light_sensor_plugin/lightSensor', Illuminance, right_light_sensor_callback)
+
+    pub = rospy.Publisher('cmd_vel', Twist, queue_size=10)
+
+    # a position x,y must change to -y,x or vice versa
+    stop(pub)
+
+    x1 = float(input("First obstacle x: "))
+    y1 = float(input("First obstacle y: "))
+    x2 = float(input("Second obstacle x: "))
+    y2 = float(input("Second obstacle y: "))
+
+    pos = localisation()
+    stop(pub)
+    rospy.sleep(1)
+
+    for i in range(2):
+        key = getKey()
+        if key == '\x03':  # break if ctrl+c pressed
+            break
+        if i == 1:
+            secondLoop = bool(input("Localisation?: "))
+            if secondLoop:
+                pos = localisation()
+                stop(pub)
+            else:
+                pos = 1
+        (x, y) = getGridCoord(pos)
+        run_a_star_left(x, y)
+        xEntry = 0.849190
+        yEntry = -1.824572
+        park()
+        leave_parking_space(xEntry, yEntry)
+        parked = False
+        run_a_star_right(xEntry, yEntry)
+
+        # rotate on the line
+        Kp = 0.3
+        desPhi = math.radians(90)
+        errThr = math.pi / 180
+        phiError = correction(desPhi, angPosz)
+        twist = Twist()
+        while abs(phiError) > errThr:
+            twist.angular.z = phiError * Kp
+            phiError = correction(desPhi, angPosz)
+            pub.publish(twist)
+
+        stop(pub)
+        rospy.sleep(1)
+
+
+    try:
+
+        pass
+
+    except:
+        print("AN ERROR OCCURED")
+
+    finally:  # once the above try/except has finished doing what it need to do (maybe the user closes teleop using ctrl-c or there is an error) then we make the robot stationary
+        twist = Twist()
+        twist.linear.x = 0.0;
+        twist.linear.y = 0.0;
+        twist.linear.z = 0.0
+        twist.angular.x = 0.0;
+        twist.angular.y = 0.0;
+        twist.angular.z = 0.0
+        pub.publish(twist)
+        print("robot stopped")
+        print(twist.angular)
+
+    if os.name != 'nt':
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
