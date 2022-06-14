@@ -1,0 +1,278 @@
+#!/usr/bin/env python
+
+import rospy
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Illuminance, LaserScan
+from geometry_msgs.msg import Twist
+import time
+import math
+
+import sys, select, os
+if os.name == 'nt':  # check if running on windows ('nt' is for windows and 'posix' is for linux)
+  import msvcrt
+else:
+  import tty, termios
+
+
+WAFFLE_MAX_LIN_VEL = 0.26
+WAFFLE_MAX_ANG_VEL = 1.82
+
+
+def constrain(input, low, high):
+	if input < low:
+	  input = low
+	elif input > high:
+	  input = high
+	else:
+	  input = input
+
+	return input
+
+def checkLinearLimitVelocity(vel):
+	return constrain(vel, -WAFFLE_MAX_LIN_VEL, WAFFLE_MAX_LIN_VEL)
+
+
+def checkAngularLimitVelocity(vel):
+	return constrain(vel, -WAFFLE_MAX_ANG_VEL, WAFFLE_MAX_ANG_VEL)
+
+
+def getKey():
+	if os.name == 'nt':
+	  return msvcrt.getch()
+
+	tty.setraw(sys.stdin.fileno())
+	rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+	if rlist:
+		key = sys.stdin.read(1)
+	else:
+		key = ''
+
+	termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+	return key
+
+# variables that subscribers will use
+leftLightIntensity = Illuminance()
+rightLightIntensity = Illuminance()
+phi = 0
+xPose = 0
+yPose = 0
+obstacle = False
+
+## callbacks
+
+def calculate_phi_callback(msg):
+	global phi
+	global xPose, yPose
+	# get phi_d and calculate phi
+	odomPose = msg.pose.pose
+	orientation_list = [odomPose.orientation.x, odomPose.orientation.y, odomPose.orientation.z, odomPose.orientation.w]
+	(roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+	phi = yaw
+	#compute current position of robot frame
+	xPose = odomPose.position.x
+	yPose = odomPose.position.y
+
+
+def left_light_sensor_callback(msg):
+	global leftLightIntensity
+	leftLightIntensity = msg.illuminance
+
+
+def right_light_sensor_callback(msg):
+	global rightLightIntensity
+	rightLightIntensity = msg.illuminance
+
+
+def check_obstacle(msg):
+	global obstacle
+	val = msg.ranges[0]
+	maxDist = 0.4
+	if math.isinf(val) == False:  # detected obstacle
+		if val > msg.range_min and val < msg.range_max:
+			if val <= msg.range_min + maxDist and val > msg.range_min + 0.2:
+				obstacle = True
+
+
+def euclidean_distance(p11, p12, p21, p22):
+	# print("computing euclidean")
+	return math.sqrt((p21 - p11)**2 + (p22 - p12)**2)
+
+
+def move_to(pub, desX, desY):
+	global phi
+	global xPose
+	global yPose
+
+	twist = Twist()
+	Kp = 0.2
+	Tp = 0.06
+	errAngThreshold = math.pi / 180 #threshold = 1 degree
+	errDistThreshold = 0.01
+
+	while(euclidean_distance(xPose, yPose, desX, desY) > errDistThreshold):
+		xError = desX - xPose
+		yError = desY - yPose
+		desPhi = math.atan2(yError, xError)
+		phiError = desPhi - phi
+
+		twist.angular.z = Kp * phiError
+		if(abs(phiError) < errAngThreshold):
+			twist.linear.x = Tp
+			twist.angular.z = 0
+
+		pub.publish(twist)
+
+
+def avoid_obstacle(pub):
+	#print("move to ")
+
+	move_to(pub, -0.941893, -0.856415)
+	move_to(pub, -0.522173, -1.190514)
+
+	twist = Twist()
+	twist.linear.x = 0.0
+	twist.angular.z = 0.0
+	pub.publish(twist)
+
+
+if __name__=="__main__":
+	if os.name != 'nt':
+		settings = termios.tcgetattr(sys.stdin)
+
+	# make node called turtlebot3_teleop_key
+	rospy.init_node('turtlebot3_teleop_key', anonymous=True)
+
+	# subscriber for odom to get phi_d
+	rospy.Subscriber('odom', Odometry, calculate_phi_callback)
+
+	# subscriber for laser scan to get distance to obstacle
+	rospy.Subscriber('scan', LaserScan, check_obstacle)
+
+	# subscriber for light sensorS to get illuminance
+	rospy.Subscriber('light_sensor_plugin/leftLightSensor', Illuminance, left_light_sensor_callback)
+
+	rospy.Subscriber('light_sensor_plugin/lightSensor', Illuminance, right_light_sensor_callback)
+
+	pub = rospy.Publisher('cmd_vel', Twist, queue_size=10)
+
+	try:
+		#SETUP
+		Kp = 50
+		Kd = 0.006
+		Tp = WAFFLE_MAX_LIN_VEL*0.1
+		angPosStep = 1e-2
+		leftSensorRead = False
+
+		lastAngPos = phi
+		desAngPos = phi
+		prevErr = 0
+		start = -1
+
+		while True:
+			key = getKey()
+			if (key == '\x03'):  # break if ctrl+c pressed
+				break
+
+			twist = Twist()
+
+			if obstacle:
+				# print("try avoid")
+				avoid_obstacle(pub)
+				obstacle = False
+				# print("find line")
+
+				if leftLightValue == rightLightValue: #force the robot to be oriented forward by turning it to the left
+					# print("equal")
+					desAngPos = lastAngPos + angPosStep
+					error = desAngPos - phi
+					twist.angular.z = Kp * error
+					rightLightValue = rightLightIntensity
+					leftLightValue = leftLightIntensity
+					lastAngPos = phi
+					pub.publish(twist)
+
+				# turn the robot to the left until left sensor reads black
+				while leftLightValue < rightLightValue:
+					desAngPos = lastAngPos + angPosStep
+					error = desAngPos - phi
+					twist.angular.z = Kp * error
+					rightLightValue = rightLightIntensity
+					leftLightValue = leftLightIntensity
+					lastAngPos = phi
+					leftSensorRead = True
+					pub.publish(twist)
+
+				# reset values
+				lastAngPos = phi
+				desAngPos = phi
+				prevErr = 0
+				start = time.time()
+
+			rightLightValue = rightLightIntensity
+			leftLightValue = leftLightIntensity
+
+			twist.linear.x = Tp
+			if rightLightValue > leftLightValue:
+				# print("left")
+				leftSensorRead = True
+				desAngPos = lastAngPos + angPosStep
+
+			elif rightLightValue < leftLightValue:
+				# print("right")
+				leftSensorRead = False
+				desAngPos = lastAngPos - angPosStep
+
+			elif rightLightValue == leftLightValue and leftLightValue == 201 and leftSensorRead == True: #check if the robot is inside the track
+				# print("leftSensorRead = False")
+				desAngPos = lastAngPos + angPosStep
+
+			elif rightLightValue == leftLightValue and leftLightValue == 201:
+				# print("leftSensorRead = True")
+				desAngPos = lastAngPos - angPosStep
+
+			elif rightLightValue == leftLightValue and leftLightValue == 0 and leftSensorRead == False:
+				# leftSensorRead = True
+				desAngPos = lastAngPos - angPosStep
+
+			elif rightLightValue == leftLightValue and leftLightValue == 0 and leftSensorRead == True:
+				# leftSensorRead = False
+				desAngPos = lastAngPos + angPosStep
+
+			error = desAngPos - phi
+			lastAngPos = phi
+			dt = 0
+			if start != -1:
+				dt = time.time() - start
+
+			start = time.time()  # reset
+
+			if dt != 0:  # prevent div by 0
+				derivative = (error - prevErr)/dt
+			else:
+				derivative = 0
+
+			# if(error == 0): # nullify integral for anti-windup
+			# integral = 0
+			twist.angular.z = checkAngularLimitVelocity(Kp * error + Kd * derivative)
+			prevErr = error
+
+			pub.publish(twist)
+			# time.sleep(1)
+
+	except:
+		print("AN ERROR OCCURRED")
+
+	finally:  # once the above try/except has finished doing what it need to do (maybe the user closes teleop using ctrl-c or there is an error) then we make the robot stationary
+		twist = Twist()
+		twist.linear.x = 0.0; twist.linear.y = 0.0; twist.linear.z = 0.0
+		twist.angular.x = 0.0; twist.angular.y = 0.0; twist.angular.z = 0.0
+		pub.publish(twist)
+		print("robot stopped")
+		print(twist.angular)
+
+	if os.name != 'nt':
+		termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+
+
+
